@@ -1,3 +1,7 @@
+https://raw.githubusercontent.com/a-virgoboy/stockiq-dashboard/main/index.html
+→ https://raw.githubusercontent.com/a-virgoboy/stockiq-dashboard/main/index.html
+Content-Type: text/plain; charset=utf-8
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1093,6 +1097,59 @@ async function loadLiveData() {
     document.getElementById('dataStatusBadge').className = 'data-badge live';
     document.getElementById('dataStatusBadge').textContent = '✅ LIVE DATA';
     document.getElementById('lastUpdated').textContent = 'Updated: ' + new Date().toLocaleString('en-IN');
+
+    // ── Merge I_VERDICT: score (0–100 → /10), grade, verdict, conviction ──
+    try {
+      const vRows = await fetchSheetData('I_VERDICT');
+      vRows.forEach(row => {
+        const s = state.stocks.find(x => x.symbol === String(row['SYMBOL'] || '').trim());
+        if (!s) return;
+        const raw = parseFloat(row['OVERALL_SCORE']);
+        s.score        = isNaN(raw) ? null : raw / 10;
+        s.grade        = row['GRADE']        || null;
+        s.conviction   = row['CONVICTION']   || null;
+        s.keyStrength  = row['KEY_STRENGTH'] || null;
+        s.keyRisk      = row['KEY_RISK']     || null;
+        const v = String(row['VERDICT'] || '').toUpperCase().trim();
+        s.verdict_label = v;
+        s.verdict = (v === 'STRONG BUY' || v === 'BUY') ? 'Y' : 'N';
+        s.rating  = v === 'STRONG BUY' ? 'strong-buy' : v === 'BUY' ? 'buy' : v === 'HOLD' ? 'hold' : 'sell';
+      });
+    } catch(e) { console.warn('I_VERDICT merge failed', e); }
+
+    // ── Merge I_VALUATION: blended/bull/bear FV + per-method ──────────────
+    try {
+      const valRows = await fetchSheetData('I_VALUATION');
+      valRows.forEach(row => {
+        const s = state.stocks.find(x => x.symbol === String(row['SYMBOL'] || '').trim());
+        if (!s) return;
+        const n = k => { const v = parseFloat(row[k]); return isNaN(v) || v === 0 ? null : v; };
+        s.blendedFv    = n('BLENDED_FV_BASE');
+        s.bullFv       = n('BLENDED_FV_BULL');
+        s.bearFv       = n('BLENDED_FV_BEAR');
+        // GEN
+        s.peFvBase     = n('PE_FV_BASE');        s.peFvBull     = n('PE_FV_BULL');        s.peFvBear     = n('PE_FV_BEAR');
+        s.dcfFvBase    = n('DCF_FV_BASE');       s.dcfFvBull    = n('DCF_FV_BULL');       s.dcfFvBear    = n('DCF_FV_BEAR');
+        s.evFvBase     = n('EVEBITDA_FV_BASE');  s.evFvBull     = n('EVEBITDA_FV_BULL');  s.evFvBear     = n('EVEBITDA_FV_BEAR');
+        // BFSI
+        s.pbFvBase     = n('PB_FV_BASE');        s.pbFvBull     = n('PB_FV_BULL');        s.pbFvBear     = n('PB_FV_BEAR');
+        s.ddmFvBase    = n('DDM_FV_BASE');       s.ddmFvBull    = n('DDM_FV_BULL');       s.ddmFvBear    = n('DDM_FV_BEAR');
+        s.peBfsiFvBase = n('PE_BFSI_FV_BASE');   s.peBfsiFvBull = n('PE_BFSI_FV_BULL');   s.peBfsiFvBear = n('PE_BFSI_FV_BEAR');
+      });
+    } catch(e) { console.warn('I_VALUATION merge failed', e); }
+
+    // ── Merge I_RESULTS: guidance, key updates ────────────────────────────
+    try {
+      const resRows = await fetchSheetData('I_RESULTS');
+      resRows.forEach(row => {
+        const s = state.stocks.find(x => x.symbol === String(row['SYMBOL'] || '').trim());
+        if (!s) return;
+        s.guidance    = row['MGMT_GUIDANCE_AI'] || null;
+        s.keyUpdates  = row['KEY_UPDATES_AI']   || null;
+        s.lastResult  = row['RESULT_PERIOD']    || null;
+      });
+    } catch(e) { console.warn('I_RESULTS merge failed', e); }
+
   } else {
     // F_MASTER is empty (Stage 1 not yet run) — fall back to sample
     state.isLive = false;
@@ -1434,16 +1491,15 @@ function renderDeepDive() {
   const up = upside(s);
   const isBfsi = s.model === 'BFSI';
 
-  // For display: approximate per-method base values from blended FV
-  // Actual values come from I_VALUATION tab once Stage 2 is deployed
+  // Per-method fair values — actual data from I_VALUATION (loaded in loadLiveData)
   const fvRows = isBfsi ? [
-    { method: 'P/Book Value (BFSI)',        base: s.blendedFv ? s.blendedFv * 0.97 : null, bull: s.bullFv ? s.bullFv * 0.97 : null, bear: s.bearFv ? s.bearFv * 0.97 : null },
-    { method: 'DDM / Residual Income',      base: s.blendedFv ? s.blendedFv * 1.02 : null, bull: s.bullFv ? s.bullFv * 1.02 : null, bear: s.bearFv ? s.bearFv * 1.02 : null },
-    { method: 'P/E Method (BFSI)',          base: s.blendedFv ? s.blendedFv * 1.01 : null, bull: s.bullFv ? s.bullFv * 1.01 : null, bear: s.bearFv ? s.bearFv * 1.01 : null },
+    { method: 'P/Book Value (BFSI)',   base: s.pbFvBase,      bull: s.pbFvBull,      bear: s.pbFvBear      },
+    { method: 'DDM / Residual Income', base: s.ddmFvBase,     bull: s.ddmFvBull,     bear: s.ddmFvBear     },
+    { method: 'P/E Method (BFSI)',     base: s.peBfsiFvBase,  bull: s.peBfsiFvBull,  bear: s.peBfsiFvBear  },
   ] : [
-    { method: 'P/E Method',                 base: s.blendedFv ? s.blendedFv * 0.95 : null, bull: s.bullFv ? s.bullFv * 0.92 : null, bear: s.bearFv ? s.bearFv * 0.95 : null },
-    { method: 'DCF (FCFF)',                 base: s.blendedFv ? s.blendedFv * 1.10 : null, bull: s.bullFv ? s.bullFv * 1.12 : null, bear: s.bearFv ? s.bearFv * 1.08 : null },
-    { method: 'EV/EBITDA',                  base: s.blendedFv ? s.blendedFv * 0.95 : null, bull: s.bullFv ? s.bullFv * 0.96 : null, bear: s.bearFv ? s.bearFv * 0.97 : null },
+    { method: 'P/E Method', base: s.peFvBase,  bull: s.peFvBull,  bear: s.peFvBear  },
+    { method: 'DCF (FCFF)', base: s.dcfFvBase, bull: s.dcfFvBull, bear: s.dcfFvBear },
+    { method: 'EV/EBITDA',  base: s.evFvBase,  bull: s.evFvBull,  bear: s.evFvBear  },
   ];
 
   return `
