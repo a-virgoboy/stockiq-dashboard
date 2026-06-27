@@ -1134,15 +1134,33 @@ async function loadLiveData() {
       });
     } catch(e) { console.warn('I_VALUATION merge failed', e); }
 
-    // ── Merge I_RESULTS: guidance, key updates ────────────────────────────
+    // ── Merge I_RESULTS: quantitative results intelligence (Stage 3 schema) ─
+    // Stage 3 is fully rule-based (no AI API). Columns:
+    //   RESULTS_GRADE (A/B/C/D) · MOMENTUM (ACCELERATING/STABLE/DECELERATING)
+    //   MOMENTUM_NOTE (plain-English insight) · growth CAGRs · YoY figures
     try {
       const resRows = await fetchSheetData('I_RESULTS');
       resRows.forEach(row => {
         const s = state.stocks.find(x => x.symbol === String(row['SYMBOL'] || '').trim());
         if (!s) return;
-        s.guidance    = row['MGMT_GUIDANCE_AI'] || null;
-        s.keyUpdates  = row['KEY_UPDATES_AI']   || null;
-        s.lastResult  = row['RESULT_PERIOD']    || null;
+        const grade    = row['RESULTS_GRADE'] || '';
+        const momentum = row['MOMENTUM']      || '';
+        const note     = row['MOMENTUM_NOTE'] || '';
+        // Build a readable insight string for the AI Reports section
+        if (grade || momentum || note) {
+          s.guidance = [
+            grade    ? 'Results Grade: ' + grade             : '',
+            momentum ? 'Momentum: '      + momentum          : '',
+            note     ?                    note                : '',
+          ].filter(Boolean).join(' · ');
+        }
+        s.lastResult  = row['DATA_DATE'] || null;
+        // Secondary metrics for deep-dive
+        s.salesCagrIR = parseFloat(row['SALES_3YR_CAGR'])  || null;
+        s.epsCagrIR   = parseFloat(row['EPS_3YR_CAGR'])    || null;
+        s.npCagrIR    = parseFloat(row['NP_3YR_CAGR'])     || null;
+        s.salesYoyIR  = parseFloat(row['SALES_YOY'])       || null;
+        s.epsYoyIR    = parseFloat(row['EPS_YOY'])         || null;
       });
     } catch(e) { console.warn('I_RESULTS merge failed', e); }
 
