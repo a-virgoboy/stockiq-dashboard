@@ -1827,9 +1827,7 @@ function renderReports() {
         <div class="source-cite">📄 Source: BSE filing/concall · Engine B (Claude) · ${s.sourceDate || '—'}</div>
       </div>
     </div>` : '').join('')}
-    <div style="background:rgba(59,130,246,0.05); border:1px solid rgba(59,130,246,0.2); border-radius:10px; padding:16px; font-size:13px; color:var(--text-secondary); margin-top:8px;">
-      💡 <strong>Engine B not yet deployed.</strong> Once Stage 3 (GAS Engine B) runs, this page will auto-populate with AI-extracted results summaries, management guidance, and expansion plans — all cite-or-abstain tagged with source URLs.
-    </div>
+    ${state.stocks.every(s => !s.guidance) ? `<div style="background:rgba(59,130,246,0.05); border:1px solid rgba(59,130,246,0.2); border-radius:10px; padding:16px; font-size:13px; color:var(--text-secondary); margin-top:8px;">💡 <strong>Results intelligence loading...</strong> Ensure Stage 3 has run and I_RESULTS tab has data. The dashboard reads RESULTS_GRADE, MOMENTUM, and MOMENTUM_NOTE columns from I_RESULTS.</div>` : ''}
   </div>`;
 }
 
