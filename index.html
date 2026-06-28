@@ -852,8 +852,16 @@ body {
 
     <div style="background:#fef9c3; border:1px solid #fde047; border-radius:8px; padding:12px; font-size:12px; color:#713f12; margin-top:4px;">
       <strong>Before connecting:</strong> In the Google Sheet, go to
-      File → Share → Publish to web → select "F_MASTER" sheet → Publish.
+      File → Share → Publish to web → publish <strong>only</strong> these sheets individually:
+      F_MASTER, I_VERDICT, I_VALUATION, I_RESULTS, I_GUIDANCE, _PUBLIC_CONFIG.
       This enables the gviz API read (view-only, no auth needed).
+    </div>
+    <div style="background:#fee2e2; border:1px solid #fca5a5; border-radius:8px; padding:12px; font-size:12px; color:#991b1b; margin-top:8px;">
+      ⚠️ <strong>Never publish <code>_CONFIG</code></strong> — it holds your Telegram bot token and
+      alert email addresses. Anyone with the Sheet ID (visible in this page's public source) could
+      read a published tab via the gviz API with no login. Keep secrets in <code>_CONFIG</code> only,
+      read it server-side from Apps Script, and put the non-secret alert thresholds in a separate
+      <code>_PUBLIC_CONFIG</code> tab instead.
     </div>
 
     <div class="modal-actions">
@@ -996,7 +1004,9 @@ let state = {
   sortBy: 'score',
   loading: false,
   alertUpsideTrigger: 20,
-  alertDownsideTrigger: -20,
+  alertDownsideTrigger: -15,
+  comparisonSelection: [],
+  growthBlendWeight: JSON.parse(localStorage.getItem('iq_growthBlend') || '{"GEN":0.5,"BFSI":0.5}'),
 };
 
 // ════════════════════════════════════════════════════════════
@@ -1166,16 +1176,39 @@ async function loadLiveData() {
       });
     } catch(e) { console.warn('I_RESULTS merge failed', e); }
 
-    // ── Merge _CONFIG: alert thresholds ───────────────────────────────────
+    // ── Merge I_GUIDANCE: management-guided targets + historical PE band ──
+    // Separate tab from F_MASTER on purpose — these are forward-looking,
+    // manually-entered-from-concall figures, not auto-pulled fundamentals.
+    // Columns expected: SYMBOL | TARGET_FY | YEARS_TO_TARGET | GUIDANCE_GROWTH_PCT
+    // | PE_AVG_10YR | PE_BULL | PE_BEAR | SOURCE | SOURCE_DATE | VERIFIED (Y/N)
     try {
-      const cfgRows = await fetchSheetData('_CONFIG');
+      const gRows = await fetchSheetData('I_GUIDANCE');
+      gRows.forEach(row => {
+        const s = state.stocks.find(x => x.symbol === String(row['SYMBOL'] || '').trim());
+        if (!s) return;
+        s.guidanceTargetFY    = row['TARGET_FY'] || null;
+        s.guidanceYears       = parseFloat(row['YEARS_TO_TARGET']) || null;
+        s.guidanceGrowthPct   = parseFloat(row['GUIDANCE_GROWTH_PCT']);
+        s.guidancePeAvg       = parseFloat(row['PE_AVG_10YR']);
+        s.guidancePeBull      = parseFloat(row['PE_BULL']);
+        s.guidancePeBear      = parseFloat(row['PE_BEAR']);
+        s.guidanceSource      = row['SOURCE'] || null;
+        s.guidanceSourceDate  = row['SOURCE_DATE'] || null;
+        s.guidanceVerified    = String(row['VERIFIED'] || '').toUpperCase().trim() === 'Y';
+      });
+    } catch(e) { console.warn('I_GUIDANCE merge failed', e); }
+
+    // ── Merge _PUBLIC_CONFIG: alert thresholds only (NEVER read _CONFIG from
+    // the browser — that tab holds the Telegram bot token + alert emails) ──
+    try {
+      const cfgRows = await fetchSheetData('_PUBLIC_CONFIG');
       const cfgMap = {};
       cfgRows.forEach(row => { cfgMap[row['KEY']] = row['VALUE']; });
       const up = parseFloat(cfgMap['ALERT_UPSIDE_TRIGGER']);
       const down = parseFloat(cfgMap['ALERT_DOWNSIDE_TRIGGER']);
       if (!isNaN(up)) state.alertUpsideTrigger = up;
       if (!isNaN(down)) state.alertDownsideTrigger = down;
-    } catch(e) { console.warn('_CONFIG merge failed', e); }
+    } catch(e) { console.warn('_PUBLIC_CONFIG merge failed', e); }
 
   } else {
     // F_MASTER is empty (Stage 1 not yet run) — fall back to sample
@@ -1219,6 +1252,63 @@ function ratingLabel(r) {
 function upside(stock) {
   if (!stock.blendedFv || !stock.cmp) return null;
   return ((stock.blendedFv - stock.cmp) / stock.cmp) * 100;
+}
+
+// ════════════════════════════════════════════════════════════
+// FORWARD VALUATION — deterministic, no AI/LLM involved.
+//
+// Methodology (per worked example): forward EPS at the management's
+// guided target FY, multiplied by a historical PE band (bear/base/bull),
+// to get a forward fair value and upside vs CMP.
+//
+//   growthUsed   = blend × guided growth% + (1 − blend) × historical EPS CAGR%
+//   forwardEPS   = currentEPS × (1 + growthUsed)^yearsToTarget
+//   FV(case)     = forwardEPS × PE(case)        [bear / base(avg) / bull]
+//   upside(case) = (FV(case) − CMP) / CMP
+//
+// Requires I_GUIDANCE row with VERIFIED = Y. Unverified or incomplete
+// inputs return null on every field — never a guessed number — so this
+// can never silently feed a wrong figure into the Alerts page.
+// ════════════════════════════════════════════════════════════
+function guidanceValuation(s) {
+  const blend = state.growthBlendWeight[s.model] ?? 0.5;
+  const hasInputs = s.guidanceVerified && s.eps != null && s.guidanceYears != null &&
+    !isNaN(s.guidancePeAvg) && !isNaN(s.guidancePeBull) && !isNaN(s.guidancePeBear);
+  if (!hasInputs) {
+    return { available: false, reason: !s.guidanceTargetFY ? 'No I_GUIDANCE row for this stock' :
+      !s.guidanceVerified ? 'Guidance entered but not VERIFIED — excluded until checked' :
+      'Guidance row missing required fields (EPS, years, or PE band)' };
+  }
+  const histCagr = s.epsCagr != null ? s.epsCagr : 0;
+  const guidedGrowth = !isNaN(s.guidanceGrowthPct) ? s.guidanceGrowthPct : histCagr;
+  const growthUsed = blend * guidedGrowth + (1 - blend) * histCagr;
+  const forwardEps = s.eps * Math.pow(1 + growthUsed / 100, s.guidanceYears);
+  const fvBase = forwardEps * s.guidancePeAvg;
+  const fvBull = forwardEps * s.guidancePeBull;
+  const fvBear = forwardEps * s.guidancePeBear;
+  const up = c => s.cmp ? ((c - s.cmp) / s.cmp) * 100 : null;
+  return {
+    available: true,
+    blend, histCagr, guidedGrowth, growthUsed, forwardEps,
+    fvBase, fvBull, fvBear,
+    upBase: up(fvBase), upBull: up(fvBull), upBear: up(fvBear),
+    targetFY: s.guidanceTargetFY, years: s.guidanceYears,
+    peAvg: s.guidancePeAvg, peBull: s.guidancePeBull, peBear: s.guidancePeBear,
+    source: s.guidanceSource, sourceDate: s.guidanceSourceDate,
+  };
+}
+
+function setGrowthBlend(model, pct) {
+  state.growthBlendWeight[model] = (+pct) / 100;
+  localStorage.setItem('iq_growthBlend', JSON.stringify(state.growthBlendWeight));
+  render();
+}
+
+function toggleComparisonSymbol(symbol) {
+  const i = state.comparisonSelection.indexOf(symbol);
+  if (i >= 0) state.comparisonSelection.splice(i, 1);
+  else state.comparisonSelection.push(symbol);
+  render();
 }
 
 function filteredStocks() {
@@ -1708,12 +1798,28 @@ function renderDeepDive() {
 // ── COMPARISON ────────────────────────────────────────────
 
 function renderComparison() {
-  const stocks = filteredStocks().slice(0, 5);
+  const all = state.stocks;
+  const selected = new Set(state.comparisonSelection);
+  const stocks = all.filter(s => selected.has(s.symbol));
   return `
   <div class="topbar">
-    <div class="topbar-left"><div class="page-title">Stock Comparison</div></div>
+    <div class="topbar-left"><div class="page-title">Stock Comparison</div><div class="stock-count">Pick which stocks to compare — only ${all.length} tracked, so select any subset</div></div>
   </div>
   <div class="content-area">
+    <div class="section-card">
+      <div class="section-title"><span class="title-icon">☑️</span>Select Stocks</div>
+      <div style="display:flex; gap:12px; flex-wrap:wrap;">
+        ${all.map(s => `
+          <label style="display:flex; align-items:center; gap:6px; padding:8px 12px; border:1px solid var(--border-color,#e2e8f0); border-radius:8px; cursor:pointer; background:${selected.has(s.symbol) ? '#eef4ff' : '#fff'};">
+            <input type="checkbox" ${selected.has(s.symbol) ? 'checked' : ''} onclick="toggleComparisonSymbol('${s.symbol}')">
+            <span style="font-weight:600;">${s.symbol}</span>
+          </label>`).join('')}
+      </div>
+    </div>
+    ${stocks.length === 0 ? `
+    <div class="section-card">
+      <div class="empty-state"><div class="icon">⚖️</div><p>Select at least one stock above to see a side-by-side comparison.</p></div>
+    </div>` : `
     <div class="section-card">
       <div class="section-title"><span class="title-icon">⚖️</span>Side-by-Side Comparison</div>
       <div class="table-container">
@@ -1749,7 +1855,7 @@ function renderComparison() {
           </tbody>
         </table>
       </div>
-    </div>
+    </div>`}
   </div>`;
 }
 
@@ -1862,6 +1968,68 @@ function renderReports() {
   </div>`;
 }
 
+// ── FORWARD VALUATION (guidance-based, deterministic) ──────
+
+function renderGuidanceValuation() {
+  const w = state.growthBlendWeight;
+  return `
+  <div class="section-card">
+    <div class="section-title"><span class="title-icon">🎯</span>Forward Valuation — Management Guidance Based</div>
+    <div style="font-size:12px; color:var(--text-secondary); margin-bottom:14px;">
+      Forward EPS at management's guided target year × historical PE band. Pure arithmetic from
+      <code>I_GUIDANCE</code> + <code>F_MASTER</code> sheet inputs — no AI estimation, no hallucinated numbers.
+      Only stocks with a <strong>VERIFIED</strong> guidance row are shown with figures; everything else
+      states why it's excluded.
+    </div>
+
+    <div style="display:flex; gap:24px; margin-bottom:16px; padding:12px; background:var(--bg-main); border-radius:8px;">
+      <div style="flex:1;">
+        <label class="form-label">Growth blend — GEN stocks: guidance ${Math.round(w.GEN*100)}% / historical CAGR ${100-Math.round(w.GEN*100)}%</label>
+        <input type="range" min="0" max="100" value="${Math.round(w.GEN*100)}" style="width:100%;" oninput="setGrowthBlend('GEN', this.value)">
+      </div>
+      <div style="flex:1;">
+        <label class="form-label">Growth blend — BFSI stocks: guidance ${Math.round(w.BFSI*100)}% / historical CAGR ${100-Math.round(w.BFSI*100)}%</label>
+        <input type="range" min="0" max="100" value="${Math.round(w.BFSI*100)}" style="width:100%;" oninput="setGrowthBlend('BFSI', this.value)">
+      </div>
+    </div>
+
+    ${state.stocks.map(s => {
+      const v = guidanceValuation(s);
+      if (!v.available) {
+        return `<div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid var(--border); font-size:13px;">
+          <span><strong>${s.symbol}</strong> — ${s.name}</span>
+          <span style="color:var(--text-muted);">⚠️ ${v.reason}</span>
+        </div>`;
+      }
+      const upClass = u => u == null ? 'tbl-na' : u > 0 ? 'tbl-green' : 'tbl-red';
+      return `
+      <div style="padding:14px 0; border-bottom:1px solid var(--border);">
+        <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
+          <div><strong style="font-size:15px;">${s.symbol}</strong> <span style="color:var(--text-secondary); font-size:12px;">${s.name} · target ${v.targetFY} (${v.years} yrs)</span></div>
+          <span style="font-size:11px; color:var(--green); font-weight:700;">✅ VERIFIED</span>
+        </div>
+        <div style="font-size:12px; color:var(--text-secondary); margin-bottom:10px;">
+          Growth used: <strong>${v.growthUsed.toFixed(1)}%</strong>
+          = ${Math.round(v.blend*100)}% × guidance (${v.guidedGrowth.toFixed(1)}%) + ${100-Math.round(v.blend*100)}% × historical 3yr EPS CAGR (${v.histCagr.toFixed(1)}%)
+          &nbsp;·&nbsp; Forward EPS = ₹${s.eps.toFixed(2)} × (1+${v.growthUsed.toFixed(1)}%)<sup>${v.years}</sup> = <strong>₹${v.forwardEps.toFixed(2)}</strong>
+        </div>
+        <table class="data-table">
+          <thead><tr><th></th><th style="color:var(--red);">Bear (PE ${v.peBear})</th><th style="color:var(--accent);">Base (PE ${v.peAvg})</th><th style="color:var(--green);">Bull (PE ${v.peBull})</th></tr></thead>
+          <tbody>
+            <tr><td style="font-weight:600;">Fair Value</td>
+              <td>₹${v.fvBear.toFixed(0)}</td><td><strong>₹${v.fvBase.toFixed(0)}</strong></td><td>₹${v.fvBull.toFixed(0)}</td></tr>
+            <tr><td style="font-weight:600;">Upside vs CMP ₹${s.cmp.toFixed(2)}</td>
+              <td class="${upClass(v.upBear)}">${v.upBear>0?'+':''}${v.upBear.toFixed(1)}%</td>
+              <td class="${upClass(v.upBase)}">${v.upBase>0?'+':''}${v.upBase.toFixed(1)}%</td>
+              <td class="${upClass(v.upBull)}">${v.upBull>0?'+':''}${v.upBull.toFixed(1)}%</td></tr>
+          </tbody>
+        </table>
+        <div class="source-cite">📄 Source: ${v.source || '—'} · ${v.sourceDate || '—'}</div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
 // ── VALUATION ─────────────────────────────────────────────
 
 function renderValuation() {
@@ -1870,8 +2038,9 @@ function renderValuation() {
     <div class="topbar-left"><div class="page-title">Valuation</div><div class="stock-count">3-Method Blended Fair Value</div></div>
   </div>
   <div class="content-area">
+    ${renderGuidanceValuation()}
     <div class="section-card">
-      <div class="section-title"><span class="title-icon">💰</span>Fair Value Summary — All Stocks</div>
+      <div class="section-title"><span class="title-icon">💰</span>Sheet Engine Fair Value (DCF / EV-EBITDA / P-B blend) — for reference</div>
       <table class="data-table">
         <thead>
           <tr>
@@ -1913,13 +2082,28 @@ function renderValuation() {
 
 // ── ALERTS ────────────────────────────────────────────────
 
+// Single source of truth for "what fair value backs an alert" — prefers the
+// verified guidance-based valuation; falls back to the sheet-engine blend
+// only if guidance isn't available; returns null (never a guess) otherwise,
+// so an alert can never fire off unverified or missing data.
+function alertBasis(s) {
+  const v = guidanceValuation(s);
+  if (v.available) return { fv: v.fvBase, up: v.upBase, source: 'Guidance-based (verified)' };
+  if (s.blendedFv != null && s.cmp != null) return { fv: s.blendedFv, up: upside(s), source: 'Sheet engine blend' };
+  return null;
+}
+
 function renderAlerts() {
   const upTrigger = state.alertUpsideTrigger;
   const downTrigger = state.alertDownsideTrigger;
+  const basisBySymbol = {};
   const triggered = state.stocks.filter(s => {
-    const up = upside(s);
-    return up != null && (up >= upTrigger || up <= downTrigger);
+    const basis = alertBasis(s);
+    if (!basis) return false;
+    basisBySymbol[s.symbol] = basis;
+    return basis.up >= upTrigger || basis.up <= downTrigger;
   });
+  const excluded = state.stocks.filter(s => !alertBasis(s));
 
   return `
   <div class="topbar">
@@ -1928,25 +2112,32 @@ function renderAlerts() {
   <div class="content-area">
     ${triggered.length === 0 ? `<div class="empty-state"><div class="icon">🔔</div><p>No alerts triggered (threshold: ${downTrigger}% / +${upTrigger}% upside/downside).</p></div>` :
       triggered.map(s => {
-        const up = upside(s);
+        const basis = basisBySymbol[s.symbol];
         return `
-        <div class="section-card" style="border-left: 4px solid ${up > 0 ? 'var(--green)' : 'var(--red)'};">
+        <div class="section-card" style="border-left: 4px solid ${basis.up > 0 ? 'var(--green)' : 'var(--red)'};">
           <div style="display:flex; justify-content:space-between; align-items:center;">
             <div>
               <strong>${s.symbol}</strong> — ${s.name}
               <div style="color:var(--text-secondary); font-size:13px; margin-top:4px;">
-                CMP: ${fmt.currency(s.cmp)} → Fair Value: ${fmt.currency(s.blendedFv)}
+                CMP: ${fmt.currency(s.cmp)} → Fair Value: ${fmt.currency(basis.fv)} · basis: <strong>${basis.source}</strong>
               </div>
             </div>
-            <div class="fv-upside ${up > 0 ? 'up' : 'down'}" style="font-size:22px; font-weight:800;">
-              ${up > 0 ? '▲ ' : '▼ '}${Math.abs(up).toFixed(1)}%
+            <div class="fv-upside ${basis.up > 0 ? 'up' : 'down'}" style="font-size:22px; font-weight:800;">
+              ${basis.up > 0 ? '▲ ' : '▼ '}${Math.abs(basis.up).toFixed(1)}%
             </div>
           </div>
         </div>`;
       }).join('')}
+    ${excluded.length > 0 ? `<div style="background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.3); border-radius:8px; padding:10px 16px; font-size:12px; color:#d97706; margin-top:8px;">
+      ⚠️ Excluded from alerting (no verified valuation basis): ${excluded.map(s=>s.symbol).join(', ')}
+    </div>` : ''}
     <div style="background:var(--bg-main); border-radius:10px; padding:16px; margin-top:16px; font-size:13px; color:var(--text-secondary);">
-      ⚙️ Alert thresholds are read from the <code>_CONFIG</code> tab of the Google Sheet (<code>ALERT_UPSIDE_TRIGGER</code>, <code>ALERT_DOWNSIDE_TRIGGER</code>); currently ${upTrigger}% / ${downTrigger}%.
-      Auto-alerts are sent via Telegram/WhatsApp through your existing LFVG GAS pipe once Stage 5 deploys.
+      ⚙️ Alert thresholds are read from the <code>_PUBLIC_CONFIG</code> tab of the Google Sheet
+      (<code>ALERT_UPSIDE_TRIGGER</code>, <code>ALERT_DOWNSIDE_TRIGGER</code>); currently ${upTrigger}% / ${downTrigger}%.
+      This page is a <strong>preview</strong> of what would alert — the actual email/Telegram dispatch runs
+      server-side in Apps Script reading <code>_CONFIG</code>. That script must apply the same
+      "verified guidance → sheet engine → exclude" basis logic shown here, or it can still send a
+      wrong number even though this page looks correct.
     </div>
   </div>`;
 }
