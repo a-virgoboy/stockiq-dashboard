@@ -995,6 +995,8 @@ let state = {
   searchTerm: '',
   sortBy: 'score',
   loading: false,
+  alertUpsideTrigger: 20,
+  alertDownsideTrigger: -20,
 };
 
 // ════════════════════════════════════════════════════════════
@@ -1164,6 +1166,17 @@ async function loadLiveData() {
       });
     } catch(e) { console.warn('I_RESULTS merge failed', e); }
 
+    // ── Merge _CONFIG: alert thresholds ───────────────────────────────────
+    try {
+      const cfgRows = await fetchSheetData('_CONFIG');
+      const cfgMap = {};
+      cfgRows.forEach(row => { cfgMap[row['KEY']] = row['VALUE']; });
+      const up = parseFloat(cfgMap['ALERT_UPSIDE_TRIGGER']);
+      const down = parseFloat(cfgMap['ALERT_DOWNSIDE_TRIGGER']);
+      if (!isNaN(up)) state.alertUpsideTrigger = up;
+      if (!isNaN(down)) state.alertDownsideTrigger = down;
+    } catch(e) { console.warn('_CONFIG merge failed', e); }
+
   } else {
     // F_MASTER is empty (Stage 1 not yet run) — fall back to sample
     state.isLive = false;
@@ -1238,6 +1251,14 @@ function filteredStocks() {
 
 function render() {
   const main = document.getElementById('mainContent');
+
+  // Preserve focus/cursor position across the full innerHTML replace below,
+  // otherwise inputs like the watchlist search box lose focus on every keystroke.
+  const active = document.activeElement;
+  const hadFocus = active && main.contains(active) && active.id;
+  const selStart = hadFocus && 'selectionStart' in active ? active.selectionStart : null;
+  const selEnd   = hadFocus && 'selectionEnd'   in active ? active.selectionEnd   : null;
+
   if (state.page === 'watchlist') main.innerHTML = renderWatchlist();
   else if (state.page === 'deepdive') main.innerHTML = renderDeepDive();
   else if (state.page === 'comparison') main.innerHTML = renderComparison();
@@ -1245,6 +1266,16 @@ function render() {
   else if (state.page === 'reports') main.innerHTML = renderReports();
   else if (state.page === 'valuation') main.innerHTML = renderValuation();
   else if (state.page === 'alerts') main.innerHTML = renderAlerts();
+
+  if (hadFocus) {
+    const restored = document.getElementById(active.id);
+    if (restored) {
+      restored.focus();
+      if (selStart != null && selEnd != null && 'setSelectionRange' in restored) {
+        restored.setSelectionRange(selStart, selEnd);
+      }
+    }
+  }
 }
 
 // ── WATCHLIST ─────────────────────────────────────────────
@@ -1265,7 +1296,7 @@ function renderWatchlist() {
     </div>
     <div class="topbar-right">
       <div class="search-box">
-        🔍 <input placeholder="Search ticker or name..." oninput="state.searchTerm=this.value; render();" value="${state.searchTerm}">
+        🔍 <input id="watchlistSearch" placeholder="Search ticker or name..." oninput="state.searchTerm=this.value; render();" value="${state.searchTerm}">
       </div>
       <button class="btn btn-ghost" onclick="loadLiveData()" title="Reload from Google Sheet">🔄 Refresh</button>
     </div>
@@ -1883,9 +1914,11 @@ function renderValuation() {
 // ── ALERTS ────────────────────────────────────────────────
 
 function renderAlerts() {
+  const upTrigger = state.alertUpsideTrigger;
+  const downTrigger = state.alertDownsideTrigger;
   const triggered = state.stocks.filter(s => {
     const up = upside(s);
-    return up != null && Math.abs(up) >= 20;
+    return up != null && (up >= upTrigger || up <= downTrigger);
   });
 
   return `
@@ -1893,7 +1926,7 @@ function renderAlerts() {
     <div class="topbar-left"><div class="page-title">Alerts</div><div class="stock-count">${triggered.length} triggered</div></div>
   </div>
   <div class="content-area">
-    ${triggered.length === 0 ? `<div class="empty-state"><div class="icon">🔔</div><p>No alerts triggered (threshold: ±20% upside/downside).</p></div>` :
+    ${triggered.length === 0 ? `<div class="empty-state"><div class="icon">🔔</div><p>No alerts triggered (threshold: ${downTrigger}% / +${upTrigger}% upside/downside).</p></div>` :
       triggered.map(s => {
         const up = upside(s);
         return `
@@ -1912,7 +1945,7 @@ function renderAlerts() {
         </div>`;
       }).join('')}
     <div style="background:var(--bg-main); border-radius:10px; padding:16px; margin-top:16px; font-size:13px; color:var(--text-secondary);">
-      ⚙️ Alert thresholds are configured in <code>_CONFIG</code> tab of the Google Sheet (<code>ALERT_UPSIDE_TRIGGER</code>, <code>ALERT_DOWNSIDE_TRIGGER</code>).
+      ⚙️ Alert thresholds are read from the <code>_CONFIG</code> tab of the Google Sheet (<code>ALERT_UPSIDE_TRIGGER</code>, <code>ALERT_DOWNSIDE_TRIGGER</code>); currently ${upTrigger}% / ${downTrigger}%.
       Auto-alerts are sent via Telegram/WhatsApp through your existing LFVG GAS pipe once Stage 5 deploys.
     </div>
   </div>`;
